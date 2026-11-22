@@ -41,6 +41,13 @@ CMAKE_POLICY_VERSION_MINIMUM=3.5 bun run tauri build --bundles app
 
 The app bundle is written to `src-tauri/target/release/bundle/macos/Prism.app`. See [BUILD.md](BUILD.md) for upstream build details. Preview builds use ad-hoc signing. macOS may ask for Microphone and Accessibility access again after installing a rebuilt preview. Launch the installed copy from Applications between updates.
 
+For a public macOS release, use a **Developer ID Application** identity from the same Apple team for every update. With the certificate and its private key installed in Keychain, save the notarization credentials locally using `xcrun notarytool store-credentials prism-notary`. Then build the signed and notarized disk image with:
+
+```sh
+APPLE_SIGNING_IDENTITY='Developer ID Application: Your Team (TEAMID)' \
+  bash scripts/package-prism-macos.sh /path/to/Prism-Apple-Silicon.dmg
+```
+
 ## Source and licenses
 
 Prism's app code is available under the [MIT license](LICENSE). Prism incorporates the local speech engine, keyboard handling, and paste pipeline from [Handy v0.10.1](https://github.com/cjpais/Handy).
