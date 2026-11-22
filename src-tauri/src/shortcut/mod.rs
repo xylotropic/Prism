@@ -61,7 +61,7 @@ pub fn init_shortcuts(app: &AppHandle) {
 }
 
 /// Whether the recording lifecycle currently wants the cancel shortcut.
-/// Written synchronously by start/stop, so it always holds the latest request.
+/// Written synchronously by the coordinator, so it always holds the latest request.
 static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the cancel shortcut is actually registered with the backend.
@@ -79,7 +79,7 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
     schedule_cancel_reconcile(app);
 }
 
-/// Unregister the cancel shortcut (called when recording stops)
+/// Unregister the cancel shortcut after cancellation or transcription.
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
     crate::secure_input::unregister_cancel_fallback(app);
 

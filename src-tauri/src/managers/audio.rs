@@ -515,11 +515,6 @@ pub struct AudioRecordingManager {
     last_input_silent: Arc<AtomicBool>,
 }
 
-pub(crate) struct CancelledRecording {
-    pub(crate) binding_id: String,
-    pub(crate) samples: Vec<f32>,
-}
-
 fn pad_recording(mut samples: Vec<f32>) -> Vec<f32> {
     if !samples.is_empty() && samples.len() < WHISPER_SAMPLE_RATE {
         samples.resize(WHISPER_SAMPLE_RATE * 5 / 4, 0.0);
@@ -1253,7 +1248,17 @@ impl AudioRecordingManager {
         self.cancel_generation.load(Ordering::Acquire) != generation
     }
 
-    pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+    pub(crate) fn cancel_pending_paste(&self) {
+        self.invalidate_recording_readiness();
+        self.cancel_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn stop_recording(
+        &self,
+        binding_id: &str,
+        cancel_generation: u64,
+        immediate: bool,
+    ) -> Option<Vec<f32>> {
         self.invalidate_recording_readiness();
         let mut state = self.state.lock().unwrap();
 
@@ -1269,7 +1274,7 @@ impl AudioRecordingManager {
                 // hidden post-release capture time.
                 let settings = get_settings(&self.app_handle);
                 let buffer_ms = settings.extra_recording_buffer_ms;
-                if buffer_ms > 0 {
+                if buffer_ms > 0 && !immediate {
                     debug!(
                         "Extra recording buffer: sleeping {}ms before stopping",
                         buffer_ms
@@ -1307,11 +1312,6 @@ impl AudioRecordingManager {
                     }
                 }
 
-                if self.was_cancelled_since(cancel_generation) {
-                    debug!("Recording stop cancelled; discarding captured samples");
-                    return None;
-                }
-
                 Some(pad_recording(samples))
             }
             _ => None,
@@ -1324,49 +1324,6 @@ impl AudioRecordingManager {
         // across a slow CoreAudio open/close → main-thread deadlock / UI
         // freeze).
         self.recording_active.load(Ordering::SeqCst)
-    }
-
-    /// Stop immediately and hand any captured samples to the cancellation flow.
-    pub(crate) fn cancel_recording(&self) -> Option<CancelledRecording> {
-        self.invalidate_recording_readiness();
-        self.cancel_generation.fetch_add(1, Ordering::AcqRel);
-        let mut state = self.state.lock().unwrap();
-
-        match *state {
-            RecordingState::Recording { ref binding_id } => {
-                let binding_id = binding_id.clone();
-                self.set_state(&mut state, RecordingState::Idle);
-                drop(state);
-
-                let samples = self
-                    .recorder
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|microphone| self.collect_recording(microphone))
-                    .unwrap_or_default();
-
-                *self.is_recording.lock().unwrap() = false;
-
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
-                    if get_settings(&self.app_handle).lazy_stream_close {
-                        self.schedule_lazy_close();
-                    } else {
-                        self.stop_microphone_stream();
-                    }
-                }
-                (!samples.is_empty()).then(|| CancelledRecording {
-                    binding_id,
-                    samples: pad_recording(samples),
-                })
-            }
-            RecordingState::Stopping => {
-                debug!("Cancellation requested while recording is stopping");
-                None
-            }
-            RecordingState::Idle => None,
-        }
     }
 }
 

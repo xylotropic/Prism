@@ -114,12 +114,24 @@ static RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// Drop guard that finishes the transcription pipeline, including immediate
 /// model unloading on early exits.
-struct FinishGuard(AppHandle, Arc<TranscriptionManager>);
+struct FinishGuard {
+    app: AppHandle,
+    manager: Arc<TranscriptionManager>,
+    retained: Option<RetainedDictation>,
+    cancel_generation: u64,
+    cancelled_on_stop: bool,
+}
 impl Drop for FinishGuard {
     fn drop(&mut self) {
-        self.1.maybe_unload_immediately("transcription session");
-        if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
-            c.notify_processing_finished();
+        self.manager
+            .maybe_unload_immediately("transcription session");
+        if let Some(c) = self.app.try_state::<TranscriptionCoordinator>() {
+            let cancelled = self.cancelled_on_stop
+                || self
+                    .app
+                    .state::<Arc<AudioRecordingManager>>()
+                    .was_cancelled_since(self.cancel_generation);
+            c.notify_processing_finished(self.retained.take(), cancelled);
         }
         // The pipeline just freed its large transient buffers (captured PCM,
         // WAV copy, engine scratch); hand the cached pages back to the OS so
@@ -701,30 +713,39 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
-        self.finish(app, binding_id, None);
+        self.finish(app, binding_id, false);
     }
 }
 
-pub(crate) fn transcribe_recovered_recording(
-    app: &AppHandle,
-    recording: crate::managers::audio::CancelledRecording,
-) {
-    RECORDING_SESSION.fetch_add(1, Ordering::SeqCst);
+pub(crate) fn retain_cancelled_dictation(app: &AppHandle, binding_id: &str) {
     TranscribeAction {
-        post_process: recording.binding_id == "transcribe_with_post_process",
+        post_process: binding_id == "transcribe_with_post_process",
     }
-    .finish(app, &recording.binding_id, Some(recording.samples));
+    .finish(app, binding_id, true);
+}
+
+/// A completed take that can still be pasted with Undo. It has already been
+/// counted and persisted according to the user's history settings.
+#[derive(Debug)]
+pub(crate) struct RetainedDictation {
+    pub(crate) text: String,
+    pub(crate) sample_count: usize,
+    pub(crate) stop_time: Instant,
+}
+
+pub(crate) fn paste_retained_dictation(app: &AppHandle, take: RetainedDictation) {
+    let generation = app
+        .state::<Arc<AudioRecordingManager>>()
+        .cancel_generation();
+    paste_dictation(app.clone(), take, false, generation);
 }
 
 impl TranscribeAction {
-    fn finish(&self, app: &AppHandle, binding_id: &str, recovered: Option<Vec<f32>>) {
+    fn finish(&self, app: &AppHandle, binding_id: &str, cancelled_on_stop: bool) {
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
             .invalidate_recording_readiness();
-
-        // Unregister the cancel shortcut when transcription stops
-        shortcut::unregister_cancel_shortcut(app);
 
         let stop_time = Instant::now();
         debug!("TranscribeAction::stop called for binding: {}", binding_id);
@@ -747,17 +768,17 @@ impl TranscribeAction {
         // Capture this before finalizing the stream so every later working state
         // targets the same overlay that was shown for this transcription.
         let use_streaming_overlay =
-            recovered.is_none() && should_use_streaming_overlay(style, tm.is_streaming());
+            !cancelled_on_stop && should_use_streaming_overlay(style, tm.is_streaming());
         if use_streaming_overlay {
             tm.emit_stream_working(StreamWorkKind::Transcribing);
-        } else {
+        } else if !cancelled_on_stop {
             show_transcribing_overlay(app);
         }
 
         // Unmute before playing audio feedback so the stop sound is audible
         rm.remove_mute();
 
-        if recovered.is_none() {
+        if !cancelled_on_stop {
             play_feedback_sound(app, SoundType::Stop);
         }
 
@@ -766,14 +787,21 @@ impl TranscribeAction {
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
+            let mut guard = FinishGuard {
+                app: ah.clone(),
+                manager: Arc::clone(&tm),
+                retained: None,
+                cancel_generation,
+                cancelled_on_stop,
+            };
+            let cancelled = || cancelled_on_stop || rm.was_cancelled_since(cancel_generation);
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id
             );
 
             let stop_recording_time = Instant::now();
-            let samples = recovered.or_else(|| rm.stop_recording(&binding_id, cancel_generation));
+            let samples = rm.stop_recording(&binding_id, cancel_generation, cancelled_on_stop);
             if let Some(samples) = samples {
                 // Read now: by the time transcribing ends, another take may
                 // have replaced it.
@@ -784,24 +812,17 @@ impl TranscribeAction {
                     samples.len()
                 );
 
-                if rm.was_cancelled_since(cancel_generation) {
-                    debug!("Transcription operation cancelled after recording stop");
-                    tm.cancel_stream();
-                    utils::hide_recording_overlay(&ah);
-                    set_tray_state(&ah, TrayIconState::Idle);
-                    return;
-                }
-
                 if samples.is_empty() {
                     debug!("Recording produced no audio samples; skipping persistence");
                     // Tear down any streaming worker so its channel doesn't leak
                     // and block the next start_stream.
                     tm.cancel_stream();
-                    finish_without_text(&ah, input_silent, 0, stop_time);
+                    if !cancelled() {
+                        finish_without_text(&ah, input_silent, 0, stop_time);
+                    }
                 } else {
                     let sample_count = samples.len();
-                    let file_name =
-                        format!("clearvoice-{}.wav", chrono::Utc::now().timestamp_millis());
+                    let file_name = format!("prism-{}.wav", chrono::Utc::now().timestamp_micros());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_handle = keep_audio.then(|| {
                         let samples_for_wav = samples.clone();
@@ -837,13 +858,6 @@ impl TranscribeAction {
                         false
                     };
 
-                    if rm.was_cancelled_since(cancel_generation) {
-                        debug!("Transcription operation cancelled before output handling");
-                        utils::hide_recording_overlay(&ah);
-                        set_tray_state(&ah, TrayIconState::Idle);
-                        return;
-                    }
-
                     match transcription_result {
                         Ok(Transcription {
                             text: transcription,
@@ -855,40 +869,38 @@ impl TranscribeAction {
                                 utils::redact_text(&transcription)
                             );
 
-                            if post_process {
-                                if use_streaming_overlay {
-                                    tm.emit_stream_working(StreamWorkKind::Polishing);
-                                } else {
-                                    show_processing_overlay(&ah);
+                            let processed = if cancelled() {
+                                None
+                            } else {
+                                if post_process {
+                                    if use_streaming_overlay {
+                                        tm.emit_stream_working(StreamWorkKind::Polishing);
+                                    } else {
+                                        show_processing_overlay(&ah);
+                                    }
                                 }
-                            }
-                            let Some(processed) = complete_unless_cancelled(
-                                process_transcription_output(&ah, &transcription, post_process),
-                                || rm.was_cancelled_since(cancel_generation),
-                            )
-                            .await
-                            else {
-                                debug!("Transcription operation cancelled during output handling");
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
+                                complete_unless_cancelled(
+                                    process_transcription_output(&ah, &transcription, post_process),
+                                    cancelled,
+                                )
+                                .await
                             };
-
-                            if rm.was_cancelled_since(cancel_generation) {
-                                debug!("Transcription operation cancelled before paste");
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
-                            }
+                            let recovery_text = processed
+                                .as_ref()
+                                .map_or_else(|| transcription.clone(), |p| p.final_text.clone());
 
                             // Keep usage totals even when recording retention is off.
                             if wav_saved {
                                 if let Err(err) = hm.save_entry(
                                     file_name,
                                     transcription,
-                                    post_process,
-                                    processed.post_processed_text.clone(),
-                                    processed.post_process_prompt.clone(),
+                                    post_process && processed.is_some(),
+                                    processed
+                                        .as_ref()
+                                        .and_then(|p| p.post_processed_text.clone()),
+                                    processed
+                                        .as_ref()
+                                        .and_then(|p| p.post_process_prompt.clone()),
                                     language,
                                 ) {
                                     error!("Failed to save history entry: {}", err);
@@ -897,151 +909,49 @@ impl TranscribeAction {
                                 error!("Failed to count dictation: {err}");
                             }
 
-                            // The user's hook only changes what gets pasted;
-                            // history above keeps the text as produced.
-                            let Some(final_text) = complete_unless_cancelled(
-                                crate::transcription_hook::apply(&ah, processed.final_text),
-                                || rm.was_cancelled_since(cancel_generation),
-                            )
-                            .await
-                            else {
-                                debug!("Transcription operation cancelled during hook");
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
+                            let retain_for_undo = || {
+                                (!recovery_text.trim().is_empty()).then_some(RetainedDictation {
+                                    text: recovery_text,
+                                    sample_count,
+                                    stop_time,
+                                })
+                            };
+                            let Some(processed) = processed.filter(|_| !cancelled()) else {
+                                guard.retained = retain_for_undo();
                                 return;
                             };
 
-                            if final_text.is_empty() {
+                            // The user's hook only changes what gets pasted;
+                            // history above keeps the text as produced.
+                            let Some(text) = complete_unless_cancelled(
+                                crate::transcription_hook::apply(&ah, processed.final_text),
+                                cancelled,
+                            )
+                            .await
+                            else {
+                                guard.retained = retain_for_undo();
+                                return;
+                            };
+
+                            if cancelled() {
+                                guard.retained = retain_for_undo();
+                            } else if text.is_empty() {
                                 finish_without_text(&ah, input_silent, sample_count, stop_time);
                             } else {
-                                let ah_clone = ah.clone();
-                                let paste_time = Instant::now();
-                                let post_process_failed = processed.post_process_failed;
-                                let rm_for_paste = Arc::clone(&rm);
-                                // Taken before the paste thread exists, and so
-                                // before the next session can start.
-                                let session = RECORDING_SESSION.load(Ordering::SeqCst);
-                                // Off the main thread: paste sleeps between steps, and a
-                                // paste into Handy's own windows needs the main thread free.
-                                std::thread::Builder::new()
-                                    .name("paste".into())
-                                    .spawn(move || {
-                                        if rm_for_paste.was_cancelled_since(cancel_generation) {
-                                            debug!(
-                                                "Transcription operation cancelled before paste"
-                                            );
-                                            utils::hide_recording_overlay(&ah_clone);
-                                            set_tray_state(&ah_clone, TrayIconState::Idle);
-                                            return;
-                                        }
-
-                                        // A new session may have taken over the
-                                        // UI while this paste ran.
-                                        let owns_ui =
-                                            || RECORDING_SESSION.load(Ordering::SeqCst) == session;
-                                        let (outcome, notice) =
-                                            match utils::paste(final_text, ah_clone.clone()) {
-                                                Ok(utils::PasteOutcome::Pasted) => {
-                                                    debug!(
-                                                        "Text pasted successfully in {:?}",
-                                                        paste_time.elapsed()
-                                                    );
-                                                    // Leave a newer session's notice alone.
-                                                    if owns_ui() {
-                                                        notices::clear(
-                                                            &ah_clone,
-                                                            NoticeSource::Dictation,
-                                                        );
-                                                    }
-                                                    let notice = post_process_failed.then(|| {
-                                                        Notice::new(
-                                                            NoticeCode::PostProcessFailed,
-                                                            NoticeSource::Dictation,
-                                                        )
-                                                    });
-                                                    (TranscriptionOutcome::Typed, notice)
-                                                }
-                                                Ok(utils::PasteOutcome::Blocked) => (
-                                                    TranscriptionOutcome::Failed,
-                                                    Some(Notice::new(
-                                                        NoticeCode::PasteBlockedElevated,
-                                                        NoticeSource::Dictation,
-                                                    )),
-                                                ),
-                                                Err(e) => {
-                                                    error!("Failed to paste transcription: {}", e);
-                                                    (
-                                                        TranscriptionOutcome::Failed,
-                                                        Some(Notice::new(
-                                                            NoticeCode::PasteFailed,
-                                                            NoticeSource::Dictation,
-                                                        )),
-                                                    )
-                                                }
-                                            };
-                                        match (owns_ui(), notice) {
-                                            (true, Some(notice)) => {
-                                                notices::raise(&ah_clone, notice)
-                                            }
-                                            (true, None)
-                                                if matches!(
-                                                    outcome,
-                                                    TranscriptionOutcome::Typed
-                                                ) =>
-                                            {
-                                                crate::overlay::show_paste_confirmation(&ah_clone);
-                                            }
-                                            (true, None) => {
-                                                utils::hide_recording_overlay(&ah_clone)
-                                            }
-                                            (false, Some(notice)) => {
-                                                notices::raise_without_overlay(&ah_clone, notice)
-                                            }
-                                            (false, None) => {}
-                                        }
-                                        if owns_ui() {
-                                            set_tray_state(&ah_clone, TrayIconState::Idle);
-                                        }
-                                        emit_transcription_complete(
-                                            &ah_clone,
-                                            outcome,
-                                            sample_count,
-                                            stop_time,
-                                        );
-                                    })
-                                    .map(|_| ())
-                                    .unwrap_or_else(|e| {
-                                        error!("Failed to start the paste thread: {:?}", e);
-                                        utils::hide_recording_overlay(&ah);
-                                        set_tray_state(&ah, TrayIconState::Idle);
-                                        emit_transcription_complete(
-                                            &ah,
-                                            TranscriptionOutcome::Failed,
-                                            sample_count,
-                                            stop_time,
-                                        );
-                                    });
+                                paste_dictation(
+                                    ah.clone(),
+                                    RetainedDictation {
+                                        text,
+                                        sample_count,
+                                        stop_time,
+                                    },
+                                    processed.post_process_failed,
+                                    cancel_generation,
+                                );
                             }
                         }
                         Err(err) => {
-                            if rm.was_cancelled_since(cancel_generation) {
-                                debug!(
-                                    "Transcription operation cancelled after transcription error"
-                                );
-                                utils::hide_recording_overlay(&ah);
-                                set_tray_state(&ah, TrayIconState::Idle);
-                                return;
-                            }
-
                             error!("Transcription failed: {}", err);
-                            notices::raise(
-                                &ah,
-                                Notice::new(
-                                    NoticeCode::TranscriptionFailed,
-                                    NoticeSource::Dictation,
-                                )
-                                .with_detail(err.to_string()),
-                            );
                             // Save entry with empty text so user can retry
                             if wav_saved {
                                 if let Err(save_err) = hm.save_entry(
@@ -1055,13 +965,32 @@ impl TranscribeAction {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
                             }
-                            set_tray_state(&ah, TrayIconState::Idle);
-                            emit_transcription_complete(
-                                &ah,
-                                TranscriptionOutcome::Failed,
-                                sample_count,
-                                stop_time,
-                            );
+                            if cancelled() {
+                                notices::raise_without_overlay(
+                                    &ah,
+                                    Notice::new(
+                                        NoticeCode::TranscriptionFailed,
+                                        NoticeSource::Dictation,
+                                    )
+                                    .with_detail(err.to_string()),
+                                );
+                            } else {
+                                notices::raise(
+                                    &ah,
+                                    Notice::new(
+                                        NoticeCode::TranscriptionFailed,
+                                        NoticeSource::Dictation,
+                                    )
+                                    .with_detail(err.to_string()),
+                                );
+                                set_tray_state(&ah, TrayIconState::Idle);
+                                emit_transcription_complete(
+                                    &ah,
+                                    TranscriptionOutcome::Failed,
+                                    sample_count,
+                                    stop_time,
+                                );
+                            }
                         }
                     }
                 }
@@ -1069,9 +998,9 @@ impl TranscribeAction {
                 debug!("No samples retrieved from recording stop");
                 // Tear down any streaming worker so its channel doesn't leak.
                 tm.cancel_stream();
-                utils::hide_recording_overlay(&ah);
-                set_tray_state(&ah, TrayIconState::Idle);
-                if !rm.was_cancelled_since(cancel_generation) {
+                if !cancelled() {
+                    utils::hide_recording_overlay(&ah);
+                    set_tray_state(&ah, TrayIconState::Idle);
                     emit_transcription_complete(&ah, TranscriptionOutcome::Empty, 0, stop_time);
                 }
             }
@@ -1082,6 +1011,87 @@ impl TranscribeAction {
             stop_time.elapsed()
         );
     }
+}
+
+fn paste_dictation(
+    ah: AppHandle,
+    take: RetainedDictation,
+    post_process_failed: bool,
+    cancel_generation: u64,
+) {
+    let RetainedDictation {
+        text: final_text,
+        sample_count,
+        stop_time,
+    } = take;
+    let ah_clone = ah.clone();
+    let paste_time = Instant::now();
+    let rm_for_paste = Arc::clone(&ah.state::<Arc<AudioRecordingManager>>());
+    let session = RECORDING_SESSION.load(Ordering::SeqCst);
+    // Off the main thread: paste sleeps between steps, and a
+    // paste into Handy's own windows needs the main thread free.
+    std::thread::Builder::new()
+        .name("paste".into())
+        .spawn(move || {
+            if rm_for_paste.was_cancelled_since(cancel_generation) {
+                debug!("Transcription operation cancelled before paste");
+                return;
+            }
+
+            // A new session may have taken over the
+            // UI while this paste ran.
+            let owns_ui = || RECORDING_SESSION.load(Ordering::SeqCst) == session;
+            let (outcome, notice) = match utils::paste(final_text, ah_clone.clone()) {
+                Ok(utils::PasteOutcome::Pasted) => {
+                    debug!("Text pasted successfully in {:?}", paste_time.elapsed());
+                    // Leave a newer session's notice alone.
+                    if owns_ui() {
+                        notices::clear(&ah_clone, NoticeSource::Dictation);
+                    }
+                    let notice = post_process_failed.then(|| {
+                        Notice::new(NoticeCode::PostProcessFailed, NoticeSource::Dictation)
+                    });
+                    (TranscriptionOutcome::Typed, notice)
+                }
+                Ok(utils::PasteOutcome::Blocked) => (
+                    TranscriptionOutcome::Failed,
+                    Some(Notice::new(
+                        NoticeCode::PasteBlockedElevated,
+                        NoticeSource::Dictation,
+                    )),
+                ),
+                Err(e) => {
+                    error!("Failed to paste transcription: {}", e);
+                    (
+                        TranscriptionOutcome::Failed,
+                        Some(Notice::new(
+                            NoticeCode::PasteFailed,
+                            NoticeSource::Dictation,
+                        )),
+                    )
+                }
+            };
+            match (owns_ui(), notice) {
+                (true, Some(notice)) => notices::raise(&ah_clone, notice),
+                (true, None) if matches!(outcome, TranscriptionOutcome::Typed) => {
+                    crate::overlay::show_paste_confirmation(&ah_clone);
+                }
+                (true, None) => utils::hide_recording_overlay(&ah_clone),
+                (false, Some(notice)) => notices::raise_without_overlay(&ah_clone, notice),
+                (false, None) => {}
+            }
+            if owns_ui() {
+                set_tray_state(&ah_clone, TrayIconState::Idle);
+            }
+            emit_transcription_complete(&ah_clone, outcome, sample_count, stop_time);
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| {
+            error!("Failed to start the paste thread: {:?}", e);
+            utils::hide_recording_overlay(&ah);
+            set_tray_state(&ah, TrayIconState::Idle);
+            emit_transcription_complete(&ah, TranscriptionOutcome::Failed, sample_count, stop_time);
+        });
 }
 
 // Cancel Action

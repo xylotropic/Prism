@@ -1,9 +1,4 @@
-use crate::managers::audio::AudioRecordingManager;
-use crate::managers::transcription::TranscriptionManager;
-use crate::shortcut;
 use crate::TranscriptionCoordinator;
-use log::info;
-use std::sync::Arc;
 use tauri::{AppHandle, Manager};
 
 // Re-export all utility modules for easy access
@@ -216,44 +211,11 @@ unsafe fn process_integrity_level(
     Ok(*GetSidSubAuthority(sid, count.saturating_sub(1)))
 }
 
-/// Centralized cancellation function that can be called from anywhere in the app.
-/// Handles cancelling both recording and transcription operations and updates UI state.
+/// Stop the current dictation and suppress its paste while retaining its text.
 pub fn cancel_current_operation(app: &AppHandle) {
-    info!("Initiating operation cancellation...");
-
-    // Unregister the cancel shortcut asynchronously
-    shortcut::unregister_cancel_shortcut(app);
-
-    // Cancel any ongoing recording
-    let audio_manager = app.state::<Arc<AudioRecordingManager>>();
-    let recording_was_active = audio_manager.is_recording();
-    let had_session = recording_was_active || crate::tray::dictation_in_progress(app);
-    let recording = audio_manager.cancel_recording();
-    if had_session {
-        crate::audio_feedback::play_feedback_sound(app, crate::audio_feedback::SoundType::Cancel);
-    }
-
-    // Abandon any live streaming transcription, and stop a transcription
-    // already in progress
-    let tm = app.state::<Arc<TranscriptionManager>>();
-    tm.cancel_stream();
-    tm.cancel_transcription();
-
-    // Update tray icon and hide overlay
-    set_tray_state(app, crate::tray::TrayIconState::Idle);
-    hide_recording_overlay(app);
-
-    // Unload model if immediate unload is enabled. Done before notifying the
-    // coordinator, so a recording started next always loads afresh; it
-    // doesn't wait for the cancelled work, so it never blocks this thread.
-    tm.maybe_unload_immediately("cancellation");
-
-    // Notify coordinator so it can keep lifecycle state coherent.
     if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
-        coordinator.notify_cancel(recording_was_active, had_session, recording);
+        coordinator.cancel_current_dictation();
     }
-
-    info!("Operation cancellation completed - returned to idle state");
 }
 
 /// Check if using the Wayland display server protocol

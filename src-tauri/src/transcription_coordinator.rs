@@ -1,6 +1,11 @@
-use crate::actions::{transcribe_recovered_recording, ACTION_MAP};
-use crate::managers::audio::{AudioRecordingManager, CancelledRecording};
+use crate::actions::{
+    paste_retained_dictation, retain_cancelled_dictation, RetainedDictation, ACTION_MAP,
+};
+use crate::audio_feedback::{play_feedback_sound, SoundType};
+use crate::managers::audio::AudioRecordingManager;
+use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, OverlayStyle, ShortcutActivation};
+use crate::tray::{dictation_in_progress, set_tray_state, TrayIconState};
 use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -208,34 +213,59 @@ enum Effect {
 /// Commands processed sequentially by the coordinator thread.
 enum Command {
     Input(InputEvent),
-    Cancel {
-        recording_was_active: bool,
-        had_session: bool,
-        recording: Option<CancelledRecording>,
-    },
+    Cancel,
     ResolveCancellation {
         id: u32,
         undo: bool,
     },
-    ProcessingFinished,
+    ProcessingFinished {
+        retained: Option<RetainedDictation>,
+        cancelled: bool,
+    },
 }
 
-/// Lives on the coordinator thread and drops any audio when the toast expires
-/// or a new take begins. Cancelled audio never reaches the history or model.
+/// The five-second Undo offer. Finishing the take and saving it do not depend
+/// on which choice is made or on the notification being visible.
 struct CancellationFeedback {
     id: u32,
-    recording: Option<CancelledRecording>,
+    output: CancelledOutput,
     expires_at: Option<Instant>,
 }
 
+enum CancelledOutput {
+    Transcribing,
+    UndoRequested,
+    Ready(RetainedDictation),
+    Unavailable,
+}
+
 impl CancellationFeedback {
-    fn show(&mut self, app: &AppHandle) {
-        self.expires_at = Some(Instant::now() + CANCEL_FEEDBACK_HOLD);
-        crate::overlay::show_recording_cancelled(app, self.id, self.recording.is_some());
+    fn show(&self, app: &AppHandle) {
+        let can_undo = matches!(
+            self.output,
+            CancelledOutput::Transcribing | CancelledOutput::Ready(_)
+        );
+        crate::overlay::show_recording_cancelled(app, self.id, can_undo);
     }
 
     fn accepts(&self, id: u32, now: Instant) -> bool {
         self.id == id && self.expires_at.is_some_and(|expires| now < expires)
+    }
+
+    fn request_undo(&mut self) -> Option<RetainedDictation> {
+        self.expires_at = None;
+        match std::mem::replace(&mut self.output, CancelledOutput::UndoRequested) {
+            CancelledOutput::Ready(take) => Some(take),
+            _ => None,
+        }
+    }
+
+    fn on_transcribed(&mut self, take: Option<RetainedDictation>) -> Option<RetainedDictation> {
+        if matches!(self.output, CancelledOutput::UndoRequested) {
+            return take;
+        }
+        self.output = take.map_or(CancelledOutput::Unavailable, CancelledOutput::Ready);
+        None
     }
 }
 
@@ -688,57 +718,97 @@ impl TranscriptionCoordinator {
                                 run_effect(&app, &mut state, effect);
                             }
                         }
-                        Command::Cancel {
-                            recording_was_active,
-                            had_session,
-                            recording,
-                        } => {
-                            // A cancel while transcribing ends the take too.
-                            let busy =
-                                recording_was_active || matches!(state.stage, Stage::Processing);
-                            state.on_cancel(recording_was_active);
-                            if busy {
-                                emit_recording_phase(&app, RecordingPhase::Cancelled);
+                        Command::Cancel => {
+                            let binding = match &state.stage {
+                                Stage::Recording(binding) => Some(binding.clone()),
+                                _ => None,
+                            };
+                            let processing = state.stage == Stage::Processing;
+                            let pending_paste = dictation_in_progress(&app);
+                            state.on_cancel(binding.is_some());
+                            app.state::<Arc<AudioRecordingManager>>()
+                                .cancel_pending_paste();
+
+                            if !processing && binding.is_none() && !pending_paste {
+                                if cancellation.take().is_some() {
+                                    crate::overlay::hide_recording_overlay(&app);
+                                } else {
+                                    let tm = app.state::<Arc<TranscriptionManager>>();
+                                    tm.cancel_stream();
+                                    tm.cancel_transcription();
+                                    tm.maybe_unload_immediately("cancellation");
+                                }
+                                continue;
                             }
-                            cancellation = if had_session
-                                && get_settings(&app).overlay_style != OverlayStyle::None
+
+                            emit_recording_phase(&app, RecordingPhase::Cancelled);
+                            crate::shortcut::unregister_cancel_shortcut(&app);
+                            if let Some(binding) = binding {
+                                state.stage = Stage::Processing;
+                                retain_cancelled_dictation(&app, &binding);
+                            }
+                            play_feedback_sound(&app, SoundType::Cancel);
+                            cancellation = if get_settings(&app).overlay_style != OverlayStyle::None
                             {
                                 cancellation_id = cancellation_id.wrapping_add(1);
-                                let mut feedback = CancellationFeedback {
+                                let feedback = CancellationFeedback {
                                     id: cancellation_id,
-                                    recording,
-                                    expires_at: None,
+                                    output: if state.stage == Stage::Processing {
+                                        CancelledOutput::Transcribing
+                                    } else {
+                                        CancelledOutput::Unavailable
+                                    },
+                                    expires_at: Some(Instant::now() + CANCEL_FEEDBACK_HOLD),
                                 };
-                                if state.stage == Stage::Idle {
-                                    feedback.show(&app);
-                                }
+                                feedback.show(&app);
                                 Some(feedback)
                             } else {
+                                crate::overlay::hide_recording_overlay(&app);
                                 None
                             };
-                        }
-                        Command::ResolveCancellation { id, undo } => {
-                            if state.stage == Stage::Idle
-                                && cancellation
-                                    .as_ref()
-                                    .is_some_and(|feedback| feedback.accepts(id, Instant::now()))
-                            {
-                                let recording =
-                                    cancellation.take().and_then(|feedback| feedback.recording);
-                                if let (true, Some(recording)) = (undo, recording) {
-                                    state.stage = Stage::Processing;
-                                    transcribe_recovered_recording(&app, recording);
-                                } else {
-                                    crate::overlay::hide_recording_overlay(&app);
-                                }
+                            if state.stage == Stage::Idle {
+                                set_tray_state(&app, TrayIconState::Idle);
                             }
                         }
-                        Command::ProcessingFinished => {
+                        Command::ResolveCancellation { id, undo } => {
+                            let Some(feedback) = cancellation
+                                .as_mut()
+                                .filter(|feedback| feedback.accepts(id, Instant::now()))
+                            else {
+                                continue;
+                            };
+                            crate::overlay::hide_recording_overlay(&app);
+                            if !undo {
+                                cancellation = None;
+                            } else if let Some(take) = feedback.request_undo() {
+                                cancellation = None;
+                                paste_retained_dictation(&app, take);
+                            }
+                        }
+                        Command::ProcessingFinished {
+                            retained,
+                            cancelled,
+                        } => {
+                            crate::shortcut::unregister_cancel_shortcut(&app);
+                            if cancelled {
+                                set_tray_state(&app, TrayIconState::Idle);
+                            }
                             if let Some(effect) = state.on_processing_finished() {
                                 cancellation = None;
                                 run_effect(&app, &mut state, effect);
                             } else if let Some(feedback) = &mut cancellation {
-                                if feedback.expires_at.is_none() {
+                                let undo_requested =
+                                    matches!(feedback.output, CancelledOutput::UndoRequested);
+                                if let Some(take) = feedback.on_transcribed(retained) {
+                                    cancellation = None;
+                                    paste_retained_dictation(&app, take);
+                                } else if undo_requested {
+                                    cancellation = None;
+                                } else if matches!(feedback.output, CancelledOutput::Unavailable)
+                                    && feedback
+                                        .expires_at
+                                        .is_some_and(|expires| Instant::now() < expires)
+                                {
                                     feedback.show(&app);
                                 }
                             }
@@ -817,21 +887,8 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub(crate) fn notify_cancel(
-        &self,
-        recording_was_active: bool,
-        had_session: bool,
-        recording: Option<CancelledRecording>,
-    ) {
-        if self
-            .tx
-            .send(Command::Cancel {
-                recording_was_active,
-                had_session,
-                recording,
-            })
-            .is_err()
-        {
+    pub(crate) fn cancel_current_dictation(&self) {
+        if self.tx.send(Command::Cancel).is_err() {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -846,8 +903,19 @@ impl TranscriptionCoordinator {
         }
     }
 
-    pub fn notify_processing_finished(&self) {
-        if self.tx.send(Command::ProcessingFinished).is_err() {
+    pub(crate) fn notify_processing_finished(
+        &self,
+        retained: Option<RetainedDictation>,
+        cancelled: bool,
+    ) {
+        if self
+            .tx
+            .send(Command::ProcessingFinished {
+                retained,
+                cancelled,
+            })
+            .is_err()
+        {
             warn!("Transcription coordinator channel closed");
         }
     }
@@ -909,7 +977,7 @@ mod tests {
         let now = Instant::now();
         let mut feedback = CancellationFeedback {
             id: 25,
-            recording: None,
+            output: CancelledOutput::Transcribing,
             expires_at: None,
         };
         assert!(!feedback.accepts(25, now));
@@ -917,6 +985,49 @@ mod tests {
         assert!(feedback.accepts(25, now));
         assert!(!feedback.accepts(24, now));
         assert!(!feedback.accepts(25, now + CANCEL_FEEDBACK_HOLD));
+    }
+
+    #[test]
+    fn cancelled_transcript_waits_for_undo_before_it_can_be_pasted() {
+        let now = Instant::now();
+        let mut feedback = CancellationFeedback {
+            id: 25,
+            output: CancelledOutput::Transcribing,
+            expires_at: Some(now + CANCEL_FEEDBACK_HOLD),
+        };
+        let take = RetainedDictation {
+            text: "Please keep this take".into(),
+            sample_count: 16_000,
+            stop_time: now,
+        };
+
+        assert!(feedback.on_transcribed(Some(take)).is_none());
+        let recovered = feedback.request_undo().expect("completed take to paste");
+        assert_eq!(recovered.text, "Please keep this take");
+        assert!(!feedback.accepts(25, now));
+        assert!(feedback.request_undo().is_none());
+    }
+
+    #[test]
+    fn early_undo_pastes_when_local_transcription_finishes() {
+        let now = Instant::now();
+        let mut feedback = CancellationFeedback {
+            id: 25,
+            output: CancelledOutput::Transcribing,
+            expires_at: Some(now + CANCEL_FEEDBACK_HOLD),
+        };
+
+        assert!(feedback.request_undo().is_none());
+        assert!(!feedback.accepts(25, now));
+        let recovered = feedback.on_transcribed(Some(RetainedDictation {
+            text: "Please recover this take".into(),
+            sample_count: 16_000,
+            stop_time: now,
+        }));
+        assert_eq!(
+            recovered.expect("take to paste").text,
+            "Please recover this take"
+        );
     }
 
     #[test]

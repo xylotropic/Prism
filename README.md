@@ -1,6 +1,6 @@
 # Prism
 
-Prism is a free, open-source dictation app for macOS. Hold the shortcut to dictate, watch new words appear in a virtual notch at the top of your display, and release to paste the finished text once. Press Escape during recording to cancel, or click **Undo** in the notice to recover that take.
+Prism is a free, open-source dictation app for macOS. Hold the shortcut to dictate, watch new words appear in a virtual notch at the top of your display, and release to paste the finished text. Escape stops recording and skips the paste. Prism still transcribes what you said, counts the words, and saves the take according to your History settings. Click **Undo** in the cancellation notice to paste that take.
 
 [Download Prism for Apple silicon](https://prism-dictation.vercel.app/Prism-Apple-Silicon.dmg)
 
@@ -28,7 +28,7 @@ Choose another speech model in Models at any time. Prism downloads it if needed 
 
 Open Prism from the menu bar to switch downloaded models, select your language or microphone, or open History. Prism imports settings, downloaded models, and history from earlier builds on first launch.
 
-The default workflow needs an internet connection to download the model once. Dictation then runs locally. The live preview holds partial words inside Prism and sends only the finalized text to the focused app. Prism keeps zero dictation recordings by default. Set a positive history limit in Settings if you want to save them. Optional cloud text processing is off by default.
+The default workflow needs an internet connection to download the model once. Dictation then runs locally. The live preview holds partial words inside Prism and sends only the finalized text to the focused app. On a new installation, History keeps the 50 most recent takes and their audio by default. Change the retention setting in History at any time. Optional cloud text processing is off by default.
 
 ## Build on macOS
 
