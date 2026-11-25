@@ -47,6 +47,13 @@ mockIPC((cmd) => {
     });
   });
 
+  const requestedLocales = new Set<string>();
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    const match = pathname.match(/\/i18n\/locales\/([^/]+)\/translation\.json$/);
+    if (match) requestedLocales.add(match[1]);
+  });
+
   await page.goto("/");
   await expect(
     page.getByRole("heading", { name: "Free Voice Transcription" }),
@@ -70,4 +77,13 @@ mockIPC((cmd) => {
     page.getByRole("group", { name: "Languages", exact: true }),
   ).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Continue" })).toBeEnabled();
+
+  expect([...requestedLocales]).toEqual(["en"]);
+  await page.getByRole("button", { name: "App language" }).click();
+  await page.getByRole("option", { name: "Español", exact: true }).click();
+  await expect(page.locator("html")).toHaveAttribute("lang", "es");
+  await expect(
+    page.getByRole("button", { name: "Idioma de la app" }),
+  ).toBeVisible();
+  expect([...requestedLocales]).toEqual(["en", "es"]);
 });
