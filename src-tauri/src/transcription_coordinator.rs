@@ -315,6 +315,9 @@ struct CoordinatorState {
     stage: Stage,
     hold: Option<Hold>,
     last_press: Option<Instant>,
+    // A toggle can be switched off while its microphone open is still blocked.
+    // If that open fails, its already-queued off edge still belongs to it.
+    failed_toggle: Option<(String, Instant)>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
     release_grace: Duration,
@@ -326,6 +329,7 @@ impl CoordinatorState {
             stage: Stage::Idle,
             hold: None,
             last_press: None,
+            failed_toggle: None,
             pending_release: None,
             pending_press: None,
             release_grace: RELEASE_GRACE,
@@ -449,6 +453,17 @@ impl CoordinatorState {
         if input.is_pressed {
             match &self.stage {
                 Stage::Idle => {
+                    if self
+                        .failed_toggle
+                        .take_if(|(binding, _)| binding == &input.binding_id)
+                        .is_some_and(|(_, failed_at)| now <= failed_at)
+                    {
+                        debug!(
+                            "Toggle off for '{}' was queued before its start failed",
+                            input.binding_id
+                        );
+                        return None;
+                    }
                     // Toggle never ends on a release: locked from the start.
                     let locked = input.mode == ShortcutActivation::Toggle;
                     return Some(self.begin_recording(
@@ -565,6 +580,7 @@ impl CoordinatorState {
 
     fn on_cancel(&mut self, recording_was_active: bool) {
         self.pending_release = None;
+        self.failed_toggle = None;
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
@@ -595,8 +611,11 @@ impl CoordinatorState {
 
     /// Reconcile the optimistic `Stage::Recording` after the executor reports
     /// whether recording actually began (microphone access can be denied).
-    fn on_start_result(&mut self, binding_id: &str, started: bool) {
+    fn on_start_result(&mut self, binding_id: &str, started: bool, completed_at: Instant) {
         if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
+            if self.is_locked() {
+                self.failed_toggle = Some((binding_id.to_owned(), completed_at));
+            }
             self.stage = Stage::Idle;
             self.hold = None;
         }
@@ -928,7 +947,7 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
             hotkey_string,
         } => {
             let started = start(app, &binding_id, &hotkey_string);
-            state.on_start_result(&binding_id, started);
+            state.on_start_result(&binding_id, started, Instant::now());
             if started {
                 emit_recording_phase(app, RecordingPhase::Started);
             }
@@ -1521,8 +1540,104 @@ mod tests {
         let effect = state.on_input(ptt_input(true), Instant::now());
         assert!(matches!(effect, Some(Effect::Start { .. })));
 
-        state.on_start_result(BINDING, false);
+        state.on_start_result(BINDING, false, Instant::now());
         assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn queued_stop_does_not_reopen_a_microphone_that_timed_out() {
+        use handy_recorder::{testing::FakeMic, CollectingSink, ErrorKind, RecorderConfig};
+
+        let mic = FakeMic::new(16_000, 1);
+        let gate = mic.hang_next_start();
+        let mut state = CoordinatorState::new();
+        let started_at = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(
+            state.on_input(toggle_input(false), started_at),
+            Some(Effect::Start { .. })
+        ));
+        let opening = thread::spawn(move || {
+            mic.open::<CollectingSink>(RecorderConfig::speech(), None, Duration::from_millis(60))
+        });
+        let stop_pressed_at = Instant::now();
+        let error = opening
+            .join()
+            .unwrap()
+            .err()
+            .expect("microphone open times out");
+        gate.release();
+        assert_eq!(error.kind(), ErrorKind::OpenTimedOut);
+
+        state.on_start_result(BINDING, false, Instant::now());
+        assert!(
+            state
+                .on_input(toggle_input(false), stop_pressed_at)
+                .is_none(),
+            "a stop pressed during the failed open must not start another open"
+        );
+        assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn failed_toggle_consumes_only_one_queued_stop() {
+        let start = Instant::now();
+        for external in [false, true] {
+            let mut state = CoordinatorState::new();
+            state.on_input(toggle_input(external), start);
+            state.on_start_result(BINDING, false, start + Duration::from_secs(10));
+            assert!(state
+                .on_input(toggle_input(external), start + ms(500))
+                .is_none());
+            assert!(matches!(
+                state.on_input(toggle_input(external), start + ms(1000)),
+                Some(Effect::Start { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_fresh_press_after_the_failure_can_retry_immediately() {
+        let mut state = CoordinatorState::new();
+        let start = Instant::now();
+        let failed = start + Duration::from_secs(10);
+        state.on_input(toggle_input(false), start);
+        state.on_start_result(BINDING, false, failed);
+        assert!(matches!(
+            state.on_input(toggle_input(false), failed + ms(1)),
+            Some(Effect::Start { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_hold_does_not_swallow_a_second_push_to_talk_press() {
+        let mut state = CoordinatorState::new();
+        let start = Instant::now();
+        state.on_input(ptt_input(true), start);
+        state.on_start_result(BINDING, false, start + Duration::from_secs(10));
+        assert!(matches!(
+            state.on_input(ptt_input(true), start + ms(500)),
+            Some(Effect::Start { .. })
+        ));
+    }
+
+    #[test]
+    fn a_failed_toggle_does_not_claim_another_binding_or_survive_cancel() {
+        let start = Instant::now();
+        for cancel in [false, true] {
+            let mut state = CoordinatorState::new();
+            state.on_input(toggle_input(false), start);
+            state.on_start_result(BINDING, false, start + Duration::from_secs(10));
+            let mut next = toggle_input(false);
+            if cancel {
+                state.on_cancel(false);
+            } else {
+                next.binding_id = "transcribe_with_post_process".into();
+            }
+            assert!(matches!(
+                state.on_input(next, start + ms(500)),
+                Some(Effect::Start { .. })
+            ));
+        }
     }
 
     // ---------------------------------------------------------------------
