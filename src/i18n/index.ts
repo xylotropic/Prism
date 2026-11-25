@@ -1,4 +1,5 @@
-import i18n from "i18next";
+import i18n, { type BackendModule } from "i18next";
+import english from "./locales/en/translation.json";
 import { initReactI18next } from "react-i18next";
 import { locale } from "@tauri-apps/plugin-os";
 import { LANGUAGE_METADATA } from "./languages";
@@ -9,23 +10,32 @@ import {
   updateDocumentLanguage,
 } from "@/lib/utils/rtl";
 
-// Auto-discover translation files using Vite's glob import
-const localeModules = import.meta.glob<{ default: Record<string, unknown> }>(
-  "./locales/*/translation.json",
-  { eager: true },
+// Keep the default language available synchronously in both webviews. The
+// remaining dictionaries ship with the app and load when their locale is used.
+const localeModules = import.meta.glob<Record<string, unknown>>(
+  ["./locales/*/translation.json", "!./locales/en/translation.json"],
+  { import: "default" },
 );
+const localeLoaders = new Map(
+  Object.entries(localeModules).map(([key, load]) => [key.split("/")[2], load]),
+);
+const localeBackend: BackendModule = {
+  type: "backend",
+  init() {},
+  read(language, namespace, callback) {
+    const load = localeLoaders.get(language);
+    if (!load || namespace !== "translation") {
+      callback(null, {});
+      return;
+    }
+    load().then(
+      (messages) => callback(null, messages),
+      (error: Error) => callback(error, false),
+    );
+  },
+};
 
-// Build resources from discovered locale files
-const resources: Record<string, { translation: Record<string, unknown> }> = {};
-for (const [path, module] of Object.entries(localeModules)) {
-  const langCode = path.match(/\.\/locales\/(.+)\/translation\.json/)?.[1];
-  if (langCode) {
-    resources[langCode] = { translation: module.default };
-  }
-}
-
-// Build supported languages list from discovered locales + metadata
-export const SUPPORTED_LANGUAGES = Object.keys(resources)
+export const SUPPORTED_LANGUAGES = ["en", ...localeLoaders.keys()]
   .map((code) => {
     const meta = LANGUAGE_METADATA[code];
     if (!meta) {
@@ -87,8 +97,10 @@ export const getSupportedLanguage = (
 
 // Initialize i18n with English as default
 // Language will be synced from settings after init
+i18n.use(localeBackend);
 i18n.use(initReactI18next).init({
-  resources,
+  resources: { en: { translation: english } },
+  partialBundledLanguages: true,
   lng: "en",
   fallbackLng: "en",
   interpolation: {
