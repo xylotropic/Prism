@@ -647,6 +647,10 @@ impl ShortcutAction for TranscribeAction {
                         debug!("Microphone readiness wait ended without receiving samples");
                         return;
                     }
+                    debug!(
+                        "First microphone samples observed {:?} after dictation action start",
+                        start_time.elapsed()
+                    );
 
                     // Development-only preview hook for evaluating the brief
                     // arming animation on hardware that normally starts too fast

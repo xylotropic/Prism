@@ -38,6 +38,10 @@ export function createAnalyzer() {
   const starts = [];
   const openTimes = [];
   const playTimes = [];
+  const firstSampleTimes = [];
+  let activeOnReady = 0;
+  let inactiveOnReady = 0;
+  let endedWithoutSamples = 0;
   let active;
   let waitingForStop = false;
   let lastStop;
@@ -85,6 +89,21 @@ export function createAnalyzer() {
       return;
     }
     if (!source.endsWith("::actions")) return;
+    const firstSample =
+      /^First microphone samples observed (\S+) after dictation action start$/.exec(
+        message,
+      );
+    if (firstSample) {
+      const elapsed = durationMs(firstSample[1]);
+      if (elapsed !== undefined) firstSampleTimes.push(elapsed);
+      return;
+    }
+    if (message === "Microphone is receiving samples; recording is ready")
+      activeOnReady++;
+    if (message === "Microphone became ready for an inactive recording")
+      inactiveOnReady++;
+    if (message === "Microphone readiness wait ended without receiving samples")
+      endedWithoutSamples++;
     if (message.startsWith("TranscribeAction::start called for binding:")) {
       if (active) incomplete++;
       const gap = lastStop === undefined ? undefined : second - lastStop;
@@ -123,6 +142,8 @@ export function createAnalyzer() {
       unpairedCompletions,
       microphoneOpens: distribution(openTimes),
       devicePlayCalls: distribution(playTimes),
+      actionToFirstSampleObserved: distribution(firstSampleTimes),
+      readiness: { activeOnReady, inactiveOnReady, endedWithoutSamples },
       confirmedOpenTimeouts: openTimeouts,
       onDemandColdStartsWithPriorStop: cold.length,
       warmWindowReplay: [30, 60, 120].map((seconds) => {

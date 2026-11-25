@@ -112,3 +112,25 @@ test("recognizes rotated logs with a timeout already in progress", () => {
   assert.equal(r.completedStarts.maxMs, 10005);
   assert.equal(r.onDemandColdStartsWithPriorStop, 0);
 });
+
+test("distinguishes receiving the first samples from readiness for an active session", () => {
+  const analyzer = createAnalyzer();
+  const action = (message) =>
+    analyzer.read(
+      "[2025-01-01][11:00:00][handy_app_lib::actions][DEBUG] " + message,
+    );
+  action("First microphone samples observed 81ms after dictation action start");
+  action("Microphone is receiving samples; recording is ready");
+  action("First microphone samples observed 8.9s after dictation action start");
+  action("Microphone became ready for an inactive recording");
+  action("Microphone readiness wait ended without receiving samples");
+  const result = analyzer.report();
+  assert.equal(result.actionToFirstSampleObserved.count, 2);
+  assert.equal(result.actionToFirstSampleObserved.maxMs, 8900);
+  assert.deepEqual(result.readiness, {
+    activeOnReady: 1,
+    inactiveOnReady: 1,
+    endedWithoutSamples: 1,
+  });
+  assert.equal(createAnalyzer().report().actionToFirstSampleObserved.count, 0);
+});
