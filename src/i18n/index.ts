@@ -17,7 +17,7 @@ const localeModules = import.meta.glob<Record<string, unknown>>(
   { import: "default" },
 );
 const localeLoaders = new Map(
-  Object.entries(localeModules).map(([path, load]) => [path.split("/")[2], load]),
+  Object.entries(localeModules).map(([key, load]) => [key.split("/")[2], load]),
 );
 const localeBackend: BackendModule = {
   type: "backend",
@@ -97,7 +97,8 @@ export const getSupportedLanguage = (
 
 // Initialize i18n with English as default
 // Language will be synced from settings after init
-i18n.use(localeBackend).use(initReactI18next).init({
+i18n.use(localeBackend);
+i18n.use(initReactI18next).init({
   resources: { en: { translation: english } },
   partialBundledLanguages: true,
   lng: "en",

@@ -48,9 +48,9 @@ mockIPC((cmd) => {
   });
 
   const requestedLocales = new Set<string>();
+  const localePath = /\/i18n\/locales\/([^/]+)\/translation\.json$/;
   page.on("request", (request) => {
-    const pathname = new URL(request.url()).pathname;
-    const match = pathname.match(/\/i18n\/locales\/([^/]+)\/translation\.json$/);
+    const match = new URL(request.url()).pathname.match(localePath);
     if (match) requestedLocales.add(match[1]);
   });
 
